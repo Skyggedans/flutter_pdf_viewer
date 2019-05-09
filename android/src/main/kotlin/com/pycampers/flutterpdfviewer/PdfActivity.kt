@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.GestureDetector
@@ -13,6 +14,7 @@ import android.view.View
 import android.view.View.SYSTEM_UI_FLAG_FULLSCREEN
 import android.view.View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
 import android.view.View.SYSTEM_UI_FLAG_IMMERSIVE
+import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -38,6 +40,27 @@ fun buildPageTranslator(opts: Bundle): PageTranslator {
     }
 
     return pageTranslator
+}
+
+class PdfViewAccessibilityDelegate : View.AccessibilityDelegate() {
+    override fun onInitializeAccessibilityNodeInfo(host: View?, info: AccessibilityNodeInfo?) {
+        info?.isScrollable = true
+
+        super.onInitializeAccessibilityNodeInfo(host, info)
+    }
+
+    override fun performAccessibilityAction(host: View?, action: Int, args: Bundle?): Boolean {
+        if (host is PDFView) {
+            if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD && host.currentPage > 0) {
+                host.jumpTo(host.currentPage - 1, true)
+            } else if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD &&
+                    host.currentPage < host.pageCount - 1) {
+                host.jumpTo(host.currentPage + 1, true)
+            }
+        }
+
+        return super.performAccessibilityAction(host, action, args)
+    }
 }
 
 class PdfActivity : Activity(), OnLoadCompleteListener, OnRenderListener, OnErrorListener {
@@ -123,6 +146,11 @@ class PdfActivity : Activity(), OnLoadCompleteListener, OnRenderListener, OnErro
         progressOverlay?.bringToFront()
 
         pdfView = findViewById(R.id.pdfView)
+
+        if (Build.VERSION.SDK_INT >= 14) {
+            pdfView?.setAccessibilityDelegate(PdfViewAccessibilityDelegate())
+        }
+
         val playerView = findViewById<PlayerView>(R.id.playerView)
         closeButton = findViewById(R.id.closeButton)
 
