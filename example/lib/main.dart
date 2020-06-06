@@ -101,6 +101,10 @@ class PdfLoaderSectionState extends State<PdfLoaderSection> {
       slideShow: option == 9,
       videoPages: videoPages,
       xorDecryptKey: key,
+      initialPage: null,
+      atExit: (pageIndex) {
+        print(">> atExit($pageIndex)");
+      },
     );
 
     switch (mode) {
@@ -182,15 +186,9 @@ class _AnalyticsSectionState extends State<AnalyticsSection> {
     return Column(
       children: <Widget>[
         RaisedButton(
-          child: Text("getAnalytics()"),
-          onPressed: () async {
-            setAnalytics(await PdfViewer.getAnalytics());
-          },
-        ),
-        RaisedButton(
-          child: Text("getAnalytics(all: true)"),
-          onPressed: () async {
-            setAnalytics(await PdfViewer.getAnalytics(all: true));
+          child: Text("read PdfViewer.analyticsEntries"),
+          onPressed: () {
+            setAnalytics(PdfViewer.analyticsEntries);
           },
         ),
         SingleChildScrollView(
@@ -202,8 +200,11 @@ class _AnalyticsSectionState extends State<AnalyticsSection> {
   }
 }
 
-void main() {
-  PdfViewer.enableAnalytics(Duration(milliseconds: 500));
+void main() async {
+  await PdfViewer.enableAnalytics(Duration(milliseconds: 500));
+  PdfViewer.analyticsCallback = (pdfId, pageIndex, paused) {
+    print("analyticsCallback: { pdfId: $pdfId, pageIndex: $pageIndex, paused: $paused }");
+  };
   runApp(new MyApp());
 }
 

@@ -5,10 +5,10 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/services.dart';
+import 'package:plugin_scaffold/plugin_scaffold.dart';
 
-MethodChannel _platform = const MethodChannel('flutter_pdf_viewer');
-
-String _sha1(str) => sha1.convert(utf8.encode(str)).toString();
+typedef AnalyticsCallback(String pdfId, int pageIndex, bool paused);
+typedef AtExit(int pageIndex);
 
 /// Describes a page containing a video
 ///
@@ -62,6 +62,10 @@ class VideoPage {
 /// - [enableImmersive]
 ///     Enables immersive mode, that hides the system UI.
 ///     This requires an API level of at least 19 (Kitkat 4.4).
+/// - [initialPage]
+///     The initial page to open when the PDF launches.
+///
+///     By default it opens the last recently opened page.
 /// - [videoPages]
 ///     A list of [VideoPage] objects, to be played as an overlay on the pdf.
 /// - [pages]
@@ -76,6 +80,8 @@ class VideoPage {
 ///     Simulate a slideshow-like view, by enabling [swipeHorizontal], [autoSpacing], [pageFling] & [pageSnap].
 /// - [pdfId]
 ///     Use this PDF identifier for recording analytics, instead of the automatically generated one.
+/// - [atExit]
+///     Called when PDF is closed.
 class PdfViewerConfig {
   String password;
   String xorDecryptKey;
@@ -87,10 +93,12 @@ class PdfViewerConfig {
   bool pageSnap;
   bool enableImmersive;
   bool autoPlay;
+  int initialPage;
   List<VideoPage> videoPages;
   List<int> pages;
   bool forceLandscape;
   String pdfId;
+  AtExit atExit;
 
   PdfViewerConfig({
     this.password,
@@ -105,9 +113,11 @@ class PdfViewerConfig {
     this.autoPlay: false,
     this.forceLandscape: false,
     slideShow: false,
+    this.initialPage,
     this.videoPages,
     this.pages,
     this.pdfId,
+    this.atExit,
   }) {
     if (slideShow) {
       swipeHorizontal = autoSpacing = pageFling = pageSnap = true;
@@ -126,6 +136,7 @@ class PdfViewerConfig {
       pageFling: pageFling,
       pageSnap: pageSnap,
       enableImmersive: enableImmersive,
+      initialPage: initialPage,
       videoPages: videoPages,
       pages: pages,
       forceLandscape: forceLandscape,
@@ -153,6 +164,7 @@ class PdfViewerConfig {
       'pageSnap': pageSnap,
       'enableImmersive': enableImmersive,
       'autoPlay': autoPlay,
+      'initialPage': initialPage,
       'videoPages': videoPagesMap,
       'pages': pages != null ? Int32List.fromList(pages) : null,
       'forceLandscape': forceLandscape,
@@ -160,60 +172,21 @@ class PdfViewerConfig {
   }
 }
 
-Future<String> _launchPdfActivity(
-  String mode,
-  String src,
-  PdfViewerConfig config,
-  String callSignature,
-) async {
-  final args = (config ?? PdfViewerConfig()).toMap();
-  final pdfId = config?.pdfId ?? _sha1("$callSignature:$args");
-  args.addAll({'mode': mode, 'src': src, 'pdfId': pdfId});
-  await _platform.invokeMethod("launchPdfActivity", args);
-  return pdfId;
-}
-
-Map<int, Duration> _serializeAnalyticsEntries(entries) {
-  return Map<int, Duration>.from(
-    entries.map((page, elapsed) {
-      return MapEntry(page, Duration(milliseconds: elapsed));
-    }),
-  );
-}
-
 class PdfViewer {
-  /// Enable recording of page by page analytics.
-  ///
-  /// The [period] is the time interval between 2 successive analytics recordings.
-  /// A smaller Duration, results in more fine-grained timestamps, at the cost of resource usage.
-  static Future<void> enableAnalytics(Duration period) {
-    return _platform.invokeMethod("enableAnalytics", period.inMilliseconds);
-  }
+  static const channel = MethodChannel('com.pycampers.flutter_pdf_viewer');
+  static Timer analyticsTimer;
 
-  /// Disable recording of analytics.
-  static Future<void> disableAnalytics() {
-    return _platform.invokeMethod("disableAnalytics", null);
-  }
+  /// A callback that notifies changes in the pdf activity.
+  ///
+  /// The [enableAnalytics] method must be called to enable these callbacks.
+  static AnalyticsCallback analyticsCallback;
 
-  /// Returns the stored analytics.
-  ///
-  /// [pdfId] is a [String] returned by all the `PdfViewer.load*()` methods.
-  /// It is a unique identifier assigned to a PDF document by the library,
-  /// based on the function arguments etc.
-  ///
-  /// If the [pdfId] is not provided or set to `null`,
-  /// the analytics are returned for the currently,
-  /// or most recently opened PDF document.
-  ///
-  /// If [all] is set to `true`, then [pdfId] is ignored,
-  /// and analytics for all PDFs are returned.
-  ///
-  /// These are not be persisted on disk, only in-memory.
-  ///
+  /// Holds the stored analytics.
   ///
   /// The returned value is a mapping from [pdfId] to a mapping,
   /// from `pageIndex` to the time [Duration] spent on that page.
   /// (Page indices start from `0`)
+  ///
   ///
   /// ```
   /// {
@@ -222,23 +195,78 @@ class PdfViewer {
   ///   }
   /// }
   /// ```
-  static Future<Map<String, Map<int, Duration>>> getAnalytics({
-    String pdfId,
-    bool all: false,
-  }) async {
-    var result;
-    if (all) {
-      result = await _platform.invokeMethod("getAllAnalytics");
-    } else {
-      result = await _platform.invokeMethod("getAnalytics", pdfId);
-    }
-    if (result == null) return {};
+  ///
+  /// [pdfId] is a [String] returned by all the `PdfViewer.load*()` methods.
+  /// It is a unique identifier assigned to a PDF document by the library,
+  /// based on the function arguments etc.
+  static final analyticsEntries = <String, Map<int, Duration>>{};
 
-    return Map<String, Map<int, Duration>>.from(
-      result.map((pdfId, entries) {
-        return MapEntry(pdfId, _serializeAnalyticsEntries(entries));
-      }),
-    );
+  /// Enable recording of page by page analytics,
+  /// and also activate [analyticsCallback].
+  ///
+  /// The [period] is the time interval between 2 successive analytics recordings.
+  /// A smaller Duration, results in more fine-grained timestamps,
+  /// at the cost of resource usage.
+  ///
+  /// If [period] is omitted, then [analyticsEntries] won't be updated.
+  /// This is useful in cases where you wish to manually use [analyticsCallback].
+  static Future<void> enableAnalytics([Duration period]) async {
+    await channel.invokeMethod("enableAnalytics");
+
+    bool paused = true;
+    String pdfId;
+    int pageIndex;
+
+    if (period != null) {
+      analyticsTimer = Timer.periodic(period, (_) {
+        if (paused) return;
+        analyticsEntries[pdfId] ??= {};
+        analyticsEntries[pdfId][pageIndex] ??= Duration();
+        analyticsEntries[pdfId][pageIndex] += period;
+      });
+    }
+
+    PluginScaffold.setCallHandler(channel, "analyticsCallback", (args) {
+      pdfId = args[0];
+      pageIndex = args[1];
+      paused = args[2];
+      analyticsCallback?.call(pdfId, pageIndex, paused);
+    });
+  }
+
+  /// Disable recording of analytics.
+  static Future<void> disableAnalytics() async {
+    await channel.invokeMethod("disableAnalytics");
+
+    analyticsTimer?.cancel();
+    analyticsTimer = null;
+
+    PluginScaffold.removeCallHandlersWithName(channel, "analyticsCallback");
+  }
+
+  /// Jump to the specified [pageIndex] of the currently opened PDF.
+  static Future<void> jumpToPage(int pageIndex) async {
+    await channel.invokeMethod("jumpToPage", pageIndex);
+  }
+
+  static String _sha1(str) => sha1.convert(utf8.encode(str)).toString();
+
+  static Future<String> _launchPdfActivity(
+    String mode,
+    String src,
+    PdfViewerConfig config,
+    String callSignature,
+  ) async {
+    final args = (config ?? PdfViewerConfig()).toMap();
+    final pdfId = config?.pdfId ?? _sha1("$callSignature:$args");
+    args.addAll({'mode': mode, 'src': src, 'pdfId': pdfId});
+    await channel.invokeMethod("launchPdfActivity", args);
+
+    PluginScaffold.setCallHandler(channel, "atExit$pdfId", (args) {
+      config.atExit?.call(args);
+    });
+
+    return pdfId;
   }
 
   /// Load Pdf from [filePath].
